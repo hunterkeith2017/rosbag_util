@@ -2,6 +2,7 @@
 import argparse
 import bisect
 import json
+import io
 import os
 import re
 from dataclasses import dataclass
@@ -46,6 +47,25 @@ def topic_to_name(topic: str) -> str:
 
 
 def save_image_msg(msg, path_base: str) -> str:
+    # CompressedImage: decode and save as PNG
+    if hasattr(msg, "format") and hasattr(msg, "data"):
+        data = bytes(getattr(msg, "data", b""))
+        try:
+            from PIL import Image
+
+            img = Image.open(io.BytesIO(data))
+            out_path = f"{path_base}.png"
+            img.save(out_path, format="PNG")
+            return out_path
+        except Exception:
+            out_path = f"{path_base}.bin"
+            with open(out_path, "wb") as f:
+                f.write(data)
+            meta_path = f"{path_base}.json"
+            meta = {"format": getattr(msg, "format", ""), "type": "compressed"}
+            save_json(meta, meta_path)
+            return out_path
+
     encoding = (msg.encoding or "").lower()
     height = int(getattr(msg, "height", 0))
     width = int(getattr(msg, "width", 0))
@@ -259,7 +279,36 @@ def extract(args) -> int:
 
     gps_topic = args.gps_topic.strip() if args.gps_topic else ""
     camera_topics = [t for t in (args.camera_topics or []) if t.strip()]
-    camera_names = {t: topic_to_name(t) for t in camera_topics}
+
+    def camera_topic_group(topic: str) -> Tuple[str, List[str]]:
+        if "/image_slave/" in topic:
+            preferred = topic.replace("/image_slave/", "/image/")
+            fallback = topic
+        elif "/image/" in topic:
+            preferred = topic
+            fallback = topic.replace("/image/", "/image_slave/")
+        else:
+            preferred = topic
+            fallback = topic
+        if preferred == fallback:
+            return preferred, [preferred]
+        return preferred, [preferred, fallback]
+
+    camera_group_map: Dict[str, List[str]] = {}
+    preferred_order: List[str] = []
+    for t in camera_topics:
+        preferred, group = camera_topic_group(t)
+        if preferred not in camera_group_map:
+            camera_group_map[preferred] = group
+            preferred_order.append(preferred)
+
+    camera_groups = [camera_group_map[k] for k in preferred_order]
+    camera_group_names = {tuple(g): topic_to_name(g[0]) for g in camera_groups}
+    flat_camera_topics = []
+    for group in camera_groups:
+        for t in group:
+            if t not in flat_camera_topics:
+                flat_camera_topics.append(t)
 
     out_dirs = {}
     for cid in car_ids:
@@ -267,10 +316,11 @@ def extract(args) -> int:
         gps_dir = os.path.join(args.out, cid, "gps")
         cam_dirs = {}
         ensure_dirs(pcd_dir, gps_dir)
-        for topic, name in camera_names.items():
+        for group in camera_groups:
+            name = camera_group_names[tuple(group)]
             cam_dir = os.path.join(args.out, cid, "camera", name)
             ensure_dirs(cam_dir)
-            cam_dirs[topic] = cam_dir
+            cam_dirs[tuple(group)] = cam_dir
         out_dirs[cid] = (pcd_dir, gps_dir, cam_dirs)
 
     print(f"[INFO] Main bag: {bags[args.main]}")
@@ -279,15 +329,16 @@ def extract(args) -> int:
     bag_indexes = {}
     for i, bag_path in enumerate(bags):
         print(f"[INFO] Index bag{i + 1}: {bag_path}")
-        idx = build_bag_index(bag_path, args.pc_topic, gps_topic, camera_topics)
+        idx = build_bag_index(bag_path, args.pc_topic, gps_topic, flat_camera_topics)
         if not idx.pc_times:
             raise RuntimeError(f"No pointcloud messages found in bag{i + 1} on {args.pc_topic}")
         if gps_topic and not idx.gps_times:
             print(f"[WARN] No GPS messages found in bag{i + 1} on {gps_topic}")
-        if camera_topics:
-            for topic in camera_topics:
-                if not idx.cam_times.get(topic):
-                    print(f"[WARN] No camera messages found in bag{i + 1} on {topic}")
+        if camera_groups:
+            for group in camera_groups:
+                if not any(idx.cam_times.get(t) for t in group):
+                    pref = group[0]
+                    print(f"[WARN] No camera messages found in bag{i + 1} on {pref} (or fallback)")
         bag_indexes[i] = idx
 
     saved = 0
@@ -333,22 +384,30 @@ def extract(args) -> int:
 
         # match camera for all bags if topics provided
         matches_cam = {}
-        if camera_topics:
-            for topic in camera_topics:
+        if camera_groups:
+            for group in camera_groups:
                 topic_matches = {}
                 for i, idx in bag_indexes.items():
-                    times = idx.cam_times.get(topic, [])
-                    msgs = idx.cam_msgs.get(topic, [])
-                    dt_cam, t_cam, cam_msg = nearest_msg(times, msgs, t_main)
-                    if dt_cam is None or dt_cam > args.max_dt:
-                        msg = "No candidate" if dt_cam is None else f"nearest_dt={dt_cam*1000:.1f}ms"
-                        print(f"[WARN] CAM{i + 1} {topic} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
-                        fail_reason = f"cam{i + 1}_{camera_names[topic]}_no_match"
+                    best = None
+                    used_topic = None
+                    for t in group:
+                        times = idx.cam_times.get(t, [])
+                        msgs = idx.cam_msgs.get(t, [])
+                        dt_cam, t_cam, cam_msg = nearest_msg(times, msgs, t_main)
+                        if dt_cam is None or dt_cam > args.max_dt:
+                            continue
+                        best = (dt_cam, t_cam, cam_msg)
+                        used_topic = t
                         break
-                    topic_matches[i] = (dt_cam, t_cam, cam_msg)
+                    if best is None:
+                        msg = "No candidate"
+                        print(f"[WARN] CAM{i + 1} {group[0]} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                        fail_reason = f"cam{i + 1}_{camera_group_names[tuple(group)]}_no_match"
+                        break
+                    topic_matches[i] = (best[0], best[1], best[2], used_topic)
                 if fail_reason:
                     break
-                matches_cam[topic] = topic_matches
+                matches_cam[tuple(group)] = topic_matches
             if fail_reason:
                 failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
                 continue
@@ -372,11 +431,11 @@ def extract(args) -> int:
                 }
                 save_json(gps_dict, out_gps)
 
-            if camera_topics:
-                for topic in camera_topics:
-                    cam_dir = cam_dirs[topic]
+            if camera_groups:
+                for group in camera_groups:
+                    cam_dir = cam_dirs[tuple(group)]
                     out_base = os.path.join(cam_dir, f"{stamp_ms}")
-                    _, _, cam_msg = matches_cam[topic][i]
+                    _, _, cam_msg, used_topic = matches_cam[tuple(group)][i]
                     save_image_msg(cam_msg, out_base)
 
         saved += 1
@@ -397,8 +456,9 @@ def extract(args) -> int:
         print(f"[DONE] {cid} pcd -> {os.path.abspath(pcd_dir)}")
         if gps_topic:
             print(f"[DONE] {cid} gps -> {os.path.abspath(gps_dir)}")
-        for topic in camera_topics:
-            print(f"[DONE] {cid} cam {topic} -> {os.path.abspath(cam_dirs[topic])}")
+        for group in camera_groups:
+            pref = group[0]
+            print(f"[DONE] {cid} cam {pref} -> {os.path.abspath(cam_dirs[tuple(group)])}")
 
     return 0
 
