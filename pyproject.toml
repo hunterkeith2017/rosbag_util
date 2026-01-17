@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosbag-util"
+version = "0.1.0"
+description = "Utilities for extracting synchronized frames from ROS bag files."
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "keiyo"}]
+
+dependencies = [
+  "numpy",
+  "open3d",
+]
+
+[project.scripts]
+rosbag-extract = "rosbag_util.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

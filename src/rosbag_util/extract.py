@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+import argparse
+import bisect
+import json
+import os
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+import numpy as np
+import open3d as o3d
+import rosbag
+import sensor_msgs.point_cloud2 as pc2
+
+
+def get_stamp_sec(msg, t):
+    """Prefer header.stamp if present, otherwise fall back to bag time."""
+    try:
+        return msg.header.stamp.to_sec()
+    except Exception:
+        return t.to_sec()
+
+
+def msg_to_xyz_numpy(msg):
+    """Convert sensor_msgs/PointCloud2 to Nx3 float32 numpy array."""
+    arr = np.fromiter(
+        pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True),
+        dtype=[("x", np.float32), ("y", np.float32), ("z", np.float32)],
+    )
+    if arr.size == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    xyz = np.vstack((arr["x"], arr["y"], arr["z"])).T
+    return xyz.astype(np.float32, copy=False)
+
+
+def save_pcd(xyz: np.ndarray, path: str, binary: bool = True):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64, copy=False))
+    o3d.io.write_point_cloud(path, pcd, write_ascii=not binary, compressed=binary)
+
+
+def rosmsg_to_dict(msg):
+    """Convert a ROS message to a JSON-serializable dict."""
+    if msg is None:
+        return None
+    if isinstance(msg, (bool, int, float, str)):
+        return msg
+    if isinstance(msg, (bytes, bytearray)):
+        return list(msg)
+    if isinstance(msg, (list, tuple)):
+        return [rosmsg_to_dict(x) for x in msg]
+    if hasattr(msg, "__slots__"):
+        out = {}
+        for field in msg.__slots__:
+            out[field] = rosmsg_to_dict(getattr(msg, field))
+        return out
+    return str(msg)
+
+
+def save_json(obj: dict, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def build_time_index(bag_path: str, topic: str):
+    times, msgs = [], []
+    with rosbag.Bag(bag_path, "r") as bag:
+        for _, msg, t in bag.read_messages(topics=[topic]):
+            times.append(get_stamp_sec(msg, t))
+            msgs.append(msg)
+    return times, msgs
+
+
+def nearest_msg(times, msgs, target_t):
+    if not times:
+        return None, None, None
+    idx = bisect.bisect_left(times, target_t)
+    cand = []
+    if idx < len(times):
+        cand.append(idx)
+    if idx > 0:
+        cand.append(idx - 1)
+
+    best_dt, best_time, best_msg = None, None, None
+    for j in cand:
+        dt = abs(times[j] - target_t)
+        if best_dt is None or dt < best_dt:
+            best_dt, best_time, best_msg = dt, times[j], msgs[j]
+    return best_dt, best_time, best_msg
+
+
+@dataclass
+class BagIndex:
+    pc_times: List[float]
+    pc_msgs: List
+    gps_times: List[float]
+    gps_msgs: List
+
+
+def ensure_dirs(*dirs):
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+
+
+def build_bag_index(bag_path: str, pc_topic: str, gps_topic: Optional[str]) -> BagIndex:
+    pc_times, pc_msgs = build_time_index(bag_path, pc_topic)
+    if gps_topic:
+        gps_times, gps_msgs = build_time_index(bag_path, gps_topic)
+    else:
+        gps_times, gps_msgs = [], []
+    return BagIndex(pc_times=pc_times, pc_msgs=pc_msgs, gps_times=gps_times, gps_msgs=gps_msgs)
+
+
+def load_config(path: str) -> dict:
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "rb") as f:
+        if ext == ".json":
+            return json.load(f)
+        if ext in (".toml", ".tml"):
+            try:
+                import tomllib
+            except Exception as exc:
+                raise RuntimeError("TOML config requires Python 3.11+ (tomllib)") from exc
+            return tomllib.load(f)
+    raise RuntimeError("Unsupported config format; use .json or .toml")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", help="Path to JSON/TOML config file")
+    parser.add_argument("--bags", nargs="+", required=True, help="Bag paths (one or more)")
+    parser.add_argument("--car-ids", nargs="*", help="Optional car IDs (same count as bags)")
+    parser.add_argument("--main", type=int, default=0, help="Main car index in --bags (default 0)")
+    parser.add_argument("--pc-topic", default="/perception/lidar/concated_points_cloud")
+    parser.add_argument("--gps-topic", default="/location/best_position")
+    parser.add_argument("--out", default="cooperative", help="Output root directory")
+    parser.add_argument("--max-dt", type=float, default=0.300, help="Max time diff in seconds")
+    parser.add_argument("--max-frames", type=int, default=-1, help="Export at most N matched frames; -1 for all")
+    parser.add_argument("--binary", action="store_true", help="Write PCD as binary_compressed")
+    return parser
+
+
+def parse_args(argv: Optional[List[str]] = None):
+    parser = build_parser()
+    pre_args, _ = parser.parse_known_args(argv)
+    if pre_args.config:
+        config = load_config(pre_args.config)
+        if not isinstance(config, dict):
+            raise RuntimeError("Config file must contain a top-level object/dict")
+        parser.set_defaults(**config)
+    return parser.parse_args(argv)
+
+
+def extract(args) -> int:
+    bags = args.bags
+    if args.main < 0 or args.main >= len(bags):
+        raise SystemExit("--main index out of range for --bags")
+    if args.car_ids:
+        if len(args.car_ids) != len(bags):
+            raise SystemExit("--car-ids length must match --bags length")
+        car_ids = args.car_ids
+    else:
+        car_ids = [f"car{i + 1}" for i in range(len(bags))]
+
+    gps_topic = args.gps_topic.strip() if args.gps_topic else ""
+
+    out_dirs = {}
+    for cid in car_ids:
+        pcd_dir = os.path.join(args.out, cid, "pcd")
+        gps_dir = os.path.join(args.out, cid, "gps")
+        ensure_dirs(pcd_dir, gps_dir)
+        out_dirs[cid] = (pcd_dir, gps_dir)
+
+    print(f"[INFO] Main bag: {bags[args.main]}")
+    print(f"[INFO] Bags: {len(bags)} | Cars: {', '.join(car_ids)}")
+
+    bag_indexes = {}
+    for i, bag_path in enumerate(bags):
+        print(f"[INFO] Index bag{i + 1}: {bag_path}")
+        idx = build_bag_index(bag_path, args.pc_topic, gps_topic)
+        if not idx.pc_times:
+            raise RuntimeError(f"No pointcloud messages found in bag{i + 1} on {args.pc_topic}")
+        if gps_topic and not idx.gps_times:
+            print(f"[WARN] No GPS messages found in bag{i + 1} on {gps_topic}")
+        bag_indexes[i] = idx
+
+    saved = 0
+    scanned = 0
+
+    main_bag = bags[args.main]
+    with rosbag.Bag(main_bag, "r") as bag:
+        for _, pc_main_msg, t_pc_main in bag.read_messages(topics=[args.pc_topic]):
+            scanned += 1
+            t_main = get_stamp_sec(pc_main_msg, t_pc_main)
+            stamp_ms = int(round(t_main * 1000.0))
+
+            # match pointclouds for all bags
+            matches_pc = {args.main: (0.0, t_main, pc_main_msg)}
+            skip = False
+            for i, idx in bag_indexes.items():
+                if i == args.main:
+                    continue
+                dt_pc, t_pc, pc_msg = nearest_msg(idx.pc_times, idx.pc_msgs, t_main)
+                if dt_pc is None or dt_pc > args.max_dt:
+                    skip = True
+                    msg = "No candidate" if dt_pc is None else f"nearest_dt={dt_pc*1000:.1f}ms"
+                    print(f"[WARN] PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                    break
+                matches_pc[i] = (dt_pc, t_pc, pc_msg)
+            if skip:
+                continue
+
+            # match gps for all bags if topic provided
+            matches_gps = {}
+            if gps_topic:
+                for i, idx in bag_indexes.items():
+                    dt_gps, t_gps, gps_msg = nearest_msg(idx.gps_times, idx.gps_msgs, t_main)
+                    if dt_gps is None or dt_gps > args.max_dt:
+                        skip = True
+                        msg = "No candidate" if dt_gps is None else f"nearest_dt={dt_gps*1000:.1f}ms"
+                        print(f"[WARN] GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                        break
+                    matches_gps[i] = (dt_gps, t_gps, gps_msg)
+            if skip:
+                continue
+
+            # save outputs for each car
+            for i, cid in enumerate(car_ids):
+                pcd_dir, gps_dir = out_dirs[cid]
+                out_pc = os.path.join(pcd_dir, f"{stamp_ms}.pcd")
+                _, _, pc_msg = matches_pc[i]
+                xyz = msg_to_xyz_numpy(pc_msg)
+                save_pcd(xyz, out_pc, binary=args.binary)
+
+                if gps_topic:
+                    out_gps = os.path.join(gps_dir, f"{stamp_ms}.json")
+                    dt_gps, t_gps, gps_msg = matches_gps[i]
+                    gps_dict = rosmsg_to_dict(gps_msg)
+                    gps_dict["_sync_meta"] = {
+                        "ref_pc_time": t_main,
+                        "gps_time": t_gps,
+                        "dt_to_ref_ms": round(dt_gps * 1000.0, 3),
+                    }
+                    save_json(gps_dict, out_gps)
+
+            saved += 1
+            if saved % 20 == 0:
+                print(f"[INFO] Saved {saved} frames at t={t_main:.6f}s")
+
+            if args.max_frames > 0 and saved >= args.max_frames:
+                break
+
+    print(f"[DONE] Scanned main pointcloud frames: {scanned}")
+    print(f"[DONE] Saved matched frames        : {saved}")
+    for cid in car_ids:
+        pcd_dir, gps_dir = out_dirs[cid]
+        print(f"[DONE] {cid} pcd -> {os.path.abspath(pcd_dir)}")
+        if gps_topic:
+            print(f"[DONE] {cid} gps -> {os.path.abspath(gps_dir)}")
+
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    return extract(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
