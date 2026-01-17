@@ -13,47 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Update version from tag
-        run: |
-          python - <<'PY'
-          import os
-          import re
-          tag = os.environ.get("GITHUB_REF_NAME", "")
-          version = tag[1:] if tag.startswith("v") else tag
-          if not version:
-            raise SystemExit("No tag version found")
-
-          def update_file(path, pattern, repl):
-            with open(path, "r", encoding="utf-8") as f:
-              data = f.read()
-            new_data, n = re.subn(pattern, repl, data, flags=re.M)
-            if n == 0:
-              raise SystemExit(f"Pattern not found in {path}")
-            with open(path, "w", encoding="utf-8") as f:
-              f.write(new_data)
-
-          update_file(
-            "pyproject.toml",
-            r'^version = ".*"$',
-            f'version = "{version}"',
-          )
-          update_file(
-            "src/rosbag_util/__init__.py",
-            r'^__version__ = ".*"$',
-            f'__version__ = "{version}"',
-          )
-          print("Updated version to", version)
-          PY
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml src/rosbag_util/__init__.py
-          git commit -m "chore: bump version to ${GITHUB_REF_NAME}"
-          git push
       - name: Build sdist/wheel
         run: |
           python -m pip install --upgrade pip build
@@ -71,6 +35,12 @@ jobs:
         with:
           name: dist
           path: dist
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          files: dist/*
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

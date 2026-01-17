@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+src/rosbag_util/_version.py
 
 .pytest_cache/
 .mypy_cache/
