@@ -3,8 +3,9 @@ import argparse
 import bisect
 import json
 import os
+import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import open3d as o3d
@@ -36,6 +37,57 @@ def save_pcd(xyz: np.ndarray, path: str, binary: bool = True):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64, copy=False))
     o3d.io.write_point_cloud(path, pcd, write_ascii=not binary, compressed=binary)
+
+
+def topic_to_name(topic: str) -> str:
+    name = topic.strip("/") or "camera"
+    name = re.sub(r"[^a-zA-Z0-9_]+", "_", name)
+    return name
+
+
+def save_image_msg(msg, path_base: str) -> str:
+    encoding = (msg.encoding or "").lower()
+    height = int(getattr(msg, "height", 0))
+    width = int(getattr(msg, "width", 0))
+    data = bytes(getattr(msg, "data", b""))
+
+    if encoding in ("rgb8", "bgr8"):
+        arr = np.frombuffer(data, dtype=np.uint8)
+        if arr.size != height * width * 3:
+            raise ValueError("Image data size mismatch for rgb/bgr8")
+        arr = arr.reshape((height, width, 3))
+        if encoding == "bgr8":
+            arr = arr[:, :, ::-1]
+        out_path = f"{path_base}.ppm"
+        with open(out_path, "wb") as f:
+            header = f"P6\n{width} {height}\n255\n".encode("ascii")
+            f.write(header)
+            f.write(arr.tobytes())
+        return out_path
+
+    if encoding == "mono8":
+        arr = np.frombuffer(data, dtype=np.uint8)
+        if arr.size != height * width:
+            raise ValueError("Image data size mismatch for mono8")
+        out_path = f"{path_base}.pgm"
+        with open(out_path, "wb") as f:
+            header = f"P5\n{width} {height}\n255\n".encode("ascii")
+            f.write(header)
+            f.write(arr.tobytes())
+        return out_path
+
+    out_path = f"{path_base}.bin"
+    with open(out_path, "wb") as f:
+        f.write(data)
+    meta_path = f"{path_base}.json"
+    meta = {
+        "encoding": encoding,
+        "height": height,
+        "width": width,
+        "step": int(getattr(msg, "step", 0)),
+    }
+    save_json(meta, meta_path)
+    return out_path
 
 
 def rosmsg_to_dict(msg):
@@ -94,6 +146,8 @@ class BagIndex:
     pc_msgs: List
     gps_times: List[float]
     gps_msgs: List
+    cam_times: Dict[str, List[float]]
+    cam_msgs: Dict[str, List]
 
 
 def ensure_dirs(*dirs):
@@ -101,37 +155,69 @@ def ensure_dirs(*dirs):
         os.makedirs(d, exist_ok=True)
 
 
-def build_bag_index(bag_path: str, pc_topic: str, gps_topic: Optional[str]) -> BagIndex:
+def build_bag_index(
+    bag_path: str,
+    pc_topic: str,
+    gps_topic: Optional[str],
+    camera_topics: List[str],
+) -> BagIndex:
     pc_times, pc_msgs = build_time_index(bag_path, pc_topic)
     if gps_topic:
         gps_times, gps_msgs = build_time_index(bag_path, gps_topic)
     else:
         gps_times, gps_msgs = [], []
-    return BagIndex(pc_times=pc_times, pc_msgs=pc_msgs, gps_times=gps_times, gps_msgs=gps_msgs)
+    cam_times = {}
+    cam_msgs = {}
+    for topic in camera_topics:
+        times, msgs = build_time_index(bag_path, topic)
+        cam_times[topic] = times
+        cam_msgs[topic] = msgs
+    return BagIndex(
+        pc_times=pc_times,
+        pc_msgs=pc_msgs,
+        gps_times=gps_times,
+        gps_msgs=gps_msgs,
+        cam_times=cam_times,
+        cam_msgs=cam_msgs,
+    )
 
 
 def load_config(path: str) -> dict:
     ext = os.path.splitext(path)[1].lower()
-    with open(path, "rb") as f:
-        if ext == ".json":
+
+    if ext == ".json":
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-        if ext in (".toml", ".tml"):
+
+    if ext in (".toml", ".tml"):
+        # Python 3.11+ -> tomllib
+        # Python <=3.10 -> tomli
+        try:
+            import tomllib  # type: ignore
+        except ModuleNotFoundError:
             try:
-                import tomllib
-            except Exception as exc:
-                raise RuntimeError("TOML config requires Python 3.11+ (tomllib)") from exc
+                import tomli as tomllib  # type: ignore
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "TOML config requires tomli (Python < 3.11) "
+                    "or Python 3.11+ with tomllib"
+                ) from exc
+
+        with open(path, "rb") as f:
             return tomllib.load(f)
+
     raise RuntimeError("Unsupported config format; use .json or .toml")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="Path to JSON/TOML config file")
-    parser.add_argument("--bags", nargs="+", required=True, help="Bag paths (one or more)")
+    parser.add_argument("--bags", nargs="+", help="Bag paths (one or more)")
     parser.add_argument("--car-ids", nargs="*", help="Optional car IDs (same count as bags)")
     parser.add_argument("--main", type=int, default=0, help="Main car index in --bags (default 0)")
     parser.add_argument("--pc-topic", default="/perception/lidar/concated_points_cloud")
     parser.add_argument("--gps-topic", default="/location/best_position")
+    parser.add_argument("--camera-topics", nargs="*", help="Optional camera topics (can be multiple)")
     parser.add_argument("--out", default="cooperative", help="Output root directory")
     parser.add_argument("--max-dt", type=float, default=0.300, help="Max time diff in seconds")
     parser.add_argument("--max-frames", type=int, default=-1, help="Export at most N matched frames; -1 for all")
@@ -140,14 +226,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: Optional[List[str]] = None):
-    parser = build_parser()
-    pre_args, _ = parser.parse_known_args(argv)
-    if pre_args.config:
-        config = load_config(pre_args.config)
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", help="Path to JSON/TOML config file")
+    config_args, _ = config_parser.parse_known_args(argv)
+
+    defaults = {}
+    if config_args.config:
+        config = load_config(config_args.config)
         if not isinstance(config, dict):
             raise RuntimeError("Config file must contain a top-level object/dict")
-        parser.set_defaults(**config)
-    return parser.parse_args(argv)
+        defaults.update(config)
+
+    parser = build_parser()
+    if defaults:
+        parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
+    if not args.bags:
+        parser.error("the following arguments are required: --bags")
+    return args
 
 
 def extract(args) -> int:
@@ -162,13 +258,20 @@ def extract(args) -> int:
         car_ids = [f"car{i + 1}" for i in range(len(bags))]
 
     gps_topic = args.gps_topic.strip() if args.gps_topic else ""
+    camera_topics = [t for t in (args.camera_topics or []) if t.strip()]
+    camera_names = {t: topic_to_name(t) for t in camera_topics}
 
     out_dirs = {}
     for cid in car_ids:
         pcd_dir = os.path.join(args.out, cid, "pcd")
         gps_dir = os.path.join(args.out, cid, "gps")
+        cam_dirs = {}
         ensure_dirs(pcd_dir, gps_dir)
-        out_dirs[cid] = (pcd_dir, gps_dir)
+        for topic, name in camera_names.items():
+            cam_dir = os.path.join(args.out, cid, "camera", name)
+            ensure_dirs(cam_dir)
+            cam_dirs[topic] = cam_dir
+        out_dirs[cid] = (pcd_dir, gps_dir, cam_dirs)
 
     print(f"[INFO] Main bag: {bags[args.main]}")
     print(f"[INFO] Bags: {len(bags)} | Cars: {', '.join(car_ids)}")
@@ -176,86 +279,126 @@ def extract(args) -> int:
     bag_indexes = {}
     for i, bag_path in enumerate(bags):
         print(f"[INFO] Index bag{i + 1}: {bag_path}")
-        idx = build_bag_index(bag_path, args.pc_topic, gps_topic)
+        idx = build_bag_index(bag_path, args.pc_topic, gps_topic, camera_topics)
         if not idx.pc_times:
             raise RuntimeError(f"No pointcloud messages found in bag{i + 1} on {args.pc_topic}")
         if gps_topic and not idx.gps_times:
             print(f"[WARN] No GPS messages found in bag{i + 1} on {gps_topic}")
+        if camera_topics:
+            for topic in camera_topics:
+                if not idx.cam_times.get(topic):
+                    print(f"[WARN] No camera messages found in bag{i + 1} on {topic}")
         bag_indexes[i] = idx
 
     saved = 0
     scanned = 0
+    failure_counts = {}
 
-    main_bag = bags[args.main]
-    with rosbag.Bag(main_bag, "r") as bag:
-        for _, pc_main_msg, t_pc_main in bag.read_messages(topics=[args.pc_topic]):
-            scanned += 1
-            t_main = get_stamp_sec(pc_main_msg, t_pc_main)
-            stamp_ms = int(round(t_main * 1000.0))
+    main_idx = bag_indexes[args.main]
+    for pc_main_msg, t_main in zip(main_idx.pc_msgs, main_idx.pc_times):
+        scanned += 1
+        stamp_ms = int(round(t_main * 1000.0))
+        fail_reason = None
 
-            # match pointclouds for all bags
-            matches_pc = {args.main: (0.0, t_main, pc_main_msg)}
-            skip = False
-            for i, idx in bag_indexes.items():
-                if i == args.main:
-                    continue
-                dt_pc, t_pc, pc_msg = nearest_msg(idx.pc_times, idx.pc_msgs, t_main)
-                if dt_pc is None or dt_pc > args.max_dt:
-                    skip = True
-                    msg = "No candidate" if dt_pc is None else f"nearest_dt={dt_pc*1000:.1f}ms"
-                    print(f"[WARN] PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
-                    break
-                matches_pc[i] = (dt_pc, t_pc, pc_msg)
-            if skip:
+        # match pointclouds for all bags
+        matches_pc = {args.main: (0.0, t_main, pc_main_msg)}
+        for i, idx in bag_indexes.items():
+            if i == args.main:
                 continue
-
-            # match gps for all bags if topic provided
-            matches_gps = {}
-            if gps_topic:
-                for i, idx in bag_indexes.items():
-                    dt_gps, t_gps, gps_msg = nearest_msg(idx.gps_times, idx.gps_msgs, t_main)
-                    if dt_gps is None or dt_gps > args.max_dt:
-                        skip = True
-                        msg = "No candidate" if dt_gps is None else f"nearest_dt={dt_gps*1000:.1f}ms"
-                        print(f"[WARN] GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
-                        break
-                    matches_gps[i] = (dt_gps, t_gps, gps_msg)
-            if skip:
-                continue
-
-            # save outputs for each car
-            for i, cid in enumerate(car_ids):
-                pcd_dir, gps_dir = out_dirs[cid]
-                out_pc = os.path.join(pcd_dir, f"{stamp_ms}.pcd")
-                _, _, pc_msg = matches_pc[i]
-                xyz = msg_to_xyz_numpy(pc_msg)
-                save_pcd(xyz, out_pc, binary=args.binary)
-
-                if gps_topic:
-                    out_gps = os.path.join(gps_dir, f"{stamp_ms}.json")
-                    dt_gps, t_gps, gps_msg = matches_gps[i]
-                    gps_dict = rosmsg_to_dict(gps_msg)
-                    gps_dict["_sync_meta"] = {
-                        "ref_pc_time": t_main,
-                        "gps_time": t_gps,
-                        "dt_to_ref_ms": round(dt_gps * 1000.0, 3),
-                    }
-                    save_json(gps_dict, out_gps)
-
-            saved += 1
-            if saved % 20 == 0:
-                print(f"[INFO] Saved {saved} frames at t={t_main:.6f}s")
-
-            if args.max_frames > 0 and saved >= args.max_frames:
+            dt_pc, t_pc, pc_msg = nearest_msg(idx.pc_times, idx.pc_msgs, t_main)
+            if dt_pc is None or dt_pc > args.max_dt:
+                msg = "No candidate" if dt_pc is None else f"nearest_dt={dt_pc*1000:.1f}ms"
+                print(f"[WARN] PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                fail_reason = f"pc{i + 1}_no_match"
                 break
+            matches_pc[i] = (dt_pc, t_pc, pc_msg)
+        if fail_reason:
+            failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
+            continue
+
+        # match gps for all bags if topic provided
+        matches_gps = {}
+        if gps_topic:
+            for i, idx in bag_indexes.items():
+                dt_gps, t_gps, gps_msg = nearest_msg(idx.gps_times, idx.gps_msgs, t_main)
+                if dt_gps is None or dt_gps > args.max_dt:
+                    msg = "No candidate" if dt_gps is None else f"nearest_dt={dt_gps*1000:.1f}ms"
+                    print(f"[WARN] GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                    fail_reason = f"gps{i + 1}_no_match"
+                    break
+                matches_gps[i] = (dt_gps, t_gps, gps_msg)
+            if fail_reason:
+                failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
+                continue
+
+        # match camera for all bags if topics provided
+        matches_cam = {}
+        if camera_topics:
+            for topic in camera_topics:
+                topic_matches = {}
+                for i, idx in bag_indexes.items():
+                    times = idx.cam_times.get(topic, [])
+                    msgs = idx.cam_msgs.get(topic, [])
+                    dt_cam, t_cam, cam_msg = nearest_msg(times, msgs, t_main)
+                    if dt_cam is None or dt_cam > args.max_dt:
+                        msg = "No candidate" if dt_cam is None else f"nearest_dt={dt_cam*1000:.1f}ms"
+                        print(f"[WARN] CAM{i + 1} {topic} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                        fail_reason = f"cam{i + 1}_{camera_names[topic]}_no_match"
+                        break
+                    topic_matches[i] = (dt_cam, t_cam, cam_msg)
+                if fail_reason:
+                    break
+                matches_cam[topic] = topic_matches
+            if fail_reason:
+                failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
+                continue
+
+        # save outputs for each car
+        for i, cid in enumerate(car_ids):
+            pcd_dir, gps_dir, cam_dirs = out_dirs[cid]
+            out_pc = os.path.join(pcd_dir, f"{stamp_ms}.pcd")
+            _, _, pc_msg = matches_pc[i]
+            xyz = msg_to_xyz_numpy(pc_msg)
+            save_pcd(xyz, out_pc, binary=args.binary)
+
+            if gps_topic:
+                out_gps = os.path.join(gps_dir, f"{stamp_ms}.json")
+                dt_gps, t_gps, gps_msg = matches_gps[i]
+                gps_dict = rosmsg_to_dict(gps_msg)
+                gps_dict["_sync_meta"] = {
+                    "ref_pc_time": t_main,
+                    "gps_time": t_gps,
+                    "dt_to_ref_ms": round(dt_gps * 1000.0, 3),
+                }
+                save_json(gps_dict, out_gps)
+
+            if camera_topics:
+                for topic in camera_topics:
+                    cam_dir = cam_dirs[topic]
+                    out_base = os.path.join(cam_dir, f"{stamp_ms}")
+                    _, _, cam_msg = matches_cam[topic][i]
+                    save_image_msg(cam_msg, out_base)
+
+        saved += 1
+        if saved % 20 == 0:
+            print(f"[INFO] Saved {saved} frames at t={t_main:.6f}s")
+
+        if args.max_frames > 0 and saved >= args.max_frames:
+            break
 
     print(f"[DONE] Scanned main pointcloud frames: {scanned}")
     print(f"[DONE] Saved matched frames        : {saved}")
+    failed = sum(failure_counts.values())
+    print(f"[DONE] Failed frames              : {failed}")
+    for reason in sorted(failure_counts.keys()):
+        print(f"[DONE] Failure reason: {reason} -> {failure_counts[reason]}")
     for cid in car_ids:
-        pcd_dir, gps_dir = out_dirs[cid]
+        pcd_dir, gps_dir, cam_dirs = out_dirs[cid]
         print(f"[DONE] {cid} pcd -> {os.path.abspath(pcd_dir)}")
         if gps_topic:
             print(f"[DONE] {cid} gps -> {os.path.abspath(gps_dir)}")
+        for topic in camera_topics:
+            print(f"[DONE] {cid} cam {topic} -> {os.path.abspath(cam_dirs[topic])}")
 
     return 0
 
