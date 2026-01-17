@@ -13,5 +13,7 @@
   ],
   "out": "cooperative/scene1",
   "max_dt": 0.3,
-  "binary": true
+  "binary": true,
+  "save_workers": 8,
+  "index_threads": 2
 }

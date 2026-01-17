@@ -8,6 +8,10 @@ Extract synchronized point cloud frames (and optional GPS) from one or more ROS 
 pip install -e .
 ```
 
+## Prerequisites
+
+- ROS Python environment with `rosbag` and `sensor_msgs` available (e.g. ROS Noetic), and `source` your ROS setup.
+
 ## Usage
 
 Single car:
@@ -31,6 +35,8 @@ rosbag-extract \
   --gps-topic "/location/best_position" \
   --out "cooperative/scene1" \
   --max-dt 0.300 \
+  --save-workers 8 \
+  --index-threads 2 \
   --binary
 ```
 
@@ -44,7 +50,9 @@ Config file (JSON):
   "gps_topic": "/location/best_position",
   "out": "cooperative/scene1",
   "max_dt": 0.3,
-  "binary": true
+  "binary": true,
+  "save_workers": 8,
+  "index_threads": 2
 }
 ```
 

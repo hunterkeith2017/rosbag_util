@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import bisect
-import json
+import concurrent.futures
 import io
+import json
 import os
 import re
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -133,6 +135,44 @@ def save_json(obj: dict, path: str):
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+def save_frame(
+    stamp_ms: int,
+    t_main: float,
+    car_ids: List[str],
+    out_dirs: Dict[str, Tuple[str, str, Dict[Tuple[str, ...], str]]],
+    matches_pc: Dict[int, Tuple[float, float, object]],
+    matches_gps: Dict[int, Tuple[float, float, object]],
+    matches_cam: Dict[Tuple[str, ...], Dict[int, Tuple[float, float, object, str]]],
+    gps_topic: str,
+    camera_groups: List[List[str]],
+    binary: bool,
+):
+    for i, cid in enumerate(car_ids):
+        pcd_dir, gps_dir, cam_dirs = out_dirs[cid]
+        out_pc = os.path.join(pcd_dir, f"{stamp_ms}.pcd")
+        _, _, pc_msg = matches_pc[i]
+        xyz = msg_to_xyz_numpy(pc_msg)
+        save_pcd(xyz, out_pc, binary=binary)
+
+        if gps_topic:
+            out_gps = os.path.join(gps_dir, f"{stamp_ms}.json")
+            dt_gps, t_gps, gps_msg = matches_gps[i]
+            gps_dict = rosmsg_to_dict(gps_msg)
+            gps_dict["_sync_meta"] = {
+                "ref_pc_time": t_main,
+                "gps_time": t_gps,
+                "dt_to_ref_ms": round(dt_gps * 1000.0, 3),
+            }
+            save_json(gps_dict, out_gps)
+
+        if camera_groups:
+            for group in camera_groups:
+                cam_dir = cam_dirs[tuple(group)]
+                out_base = os.path.join(cam_dir, f"{stamp_ms}")
+                _, _, cam_msg, _used_topic = matches_cam[tuple(group)][i]
+                save_image_msg(cam_msg, out_base)
+
+
 def build_time_index(bag_path: str, topic: str):
     times, msgs = [], []
     with rosbag.Bag(bag_path, "r") as bag:
@@ -242,6 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-dt", type=float, default=0.300, help="Max time diff in seconds")
     parser.add_argument("--max-frames", type=int, default=-1, help="Export at most N matched frames; -1 for all")
     parser.add_argument("--binary", action="store_true", help="Write PCD as binary_compressed")
+    parser.add_argument("--save-workers", type=int, default=4, help="Worker threads for saving outputs")
+    parser.add_argument("--index-threads", type=int, default=0, help="Threads for indexing bags (0=auto)")
     return parser
 
 
@@ -327,126 +369,170 @@ def extract(args) -> int:
     print(f"[INFO] Bags: {len(bags)} | Cars: {', '.join(car_ids)}")
 
     bag_indexes = {}
-    for i, bag_path in enumerate(bags):
+    index_workers = args.index_threads or min(4, len(bags))
+
+    def index_one(i_bag):
+        i, bag_path = i_bag
         print(f"[INFO] Index bag{i + 1}: {bag_path}")
         idx = build_bag_index(bag_path, args.pc_topic, gps_topic, flat_camera_topics)
-        if not idx.pc_times:
-            raise RuntimeError(f"No pointcloud messages found in bag{i + 1} on {args.pc_topic}")
-        if gps_topic and not idx.gps_times:
-            print(f"[WARN] No GPS messages found in bag{i + 1} on {gps_topic}")
-        if camera_groups:
-            for group in camera_groups:
-                if not any(idx.cam_times.get(t) for t in group):
-                    pref = group[0]
-                    print(f"[WARN] No camera messages found in bag{i + 1} on {pref} (or fallback)")
-        bag_indexes[i] = idx
+        return i, idx
 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as executor:
+        futures = [executor.submit(index_one, (i, bag_path)) for i, bag_path in enumerate(bags)]
+        for fut in concurrent.futures.as_completed(futures):
+            i, idx = fut.result()
+            if not idx.pc_times:
+                raise RuntimeError(f"No pointcloud messages found in bag{i + 1} on {args.pc_topic}")
+            if gps_topic and not idx.gps_times:
+                print(f"[WARN] No GPS messages found in bag{i + 1} on {gps_topic}")
+            if camera_groups:
+                for group in camera_groups:
+                    if not any(idx.cam_times.get(t) for t in group):
+                        pref = group[0]
+                        print(f"[WARN] No camera messages found in bag{i + 1} on {pref} (or fallback)")
+            bag_indexes[i] = idx
+
+    matched = 0
     saved = 0
     scanned = 0
     failure_counts = {}
 
+    def record_save_error(err: Exception):
+        failure_counts["save_error"] = failure_counts.get("save_error", 0) + 1
+        print(f"[WARN] Save failed: {err}")
+
     main_idx = bag_indexes[args.main]
-    for pc_main_msg, t_main in zip(main_idx.pc_msgs, main_idx.pc_times):
-        scanned += 1
-        stamp_ms = int(round(t_main * 1000.0))
-        fail_reason = None
+    max_in_flight = max(1, max(1, args.save_workers) * 4)
+    pending = deque()
 
-        # match pointclouds for all bags
-        matches_pc = {args.main: (0.0, t_main, pc_main_msg)}
-        for i, idx in bag_indexes.items():
-            if i == args.main:
-                continue
-            dt_pc, t_pc, pc_msg = nearest_msg(idx.pc_times, idx.pc_msgs, t_main)
-            if dt_pc is None or dt_pc > args.max_dt:
-                msg = "No candidate" if dt_pc is None else f"nearest_dt={dt_pc*1000:.1f}ms"
-                print(f"[WARN] PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
-                fail_reason = f"pc{i + 1}_no_match"
-                break
-            matches_pc[i] = (dt_pc, t_pc, pc_msg)
-        if fail_reason:
-            failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
-            continue
+    def consume_future(fut):
+        nonlocal saved
+        try:
+            fut.result()
+            saved += 1
+            if saved % 20 == 0:
+                print(f"[INFO] Saved {saved} frames")
+        except Exception as exc:
+            record_save_error(exc)
 
-        # match gps for all bags if topic provided
-        matches_gps = {}
-        if gps_topic:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.save_workers)) as executor:
+        for pc_main_msg, t_main in zip(main_idx.pc_msgs, main_idx.pc_times):
+            scanned += 1
+            stamp_ms = int(round(t_main * 1000.0))
+            fail_reason = None
+
+            # match pointclouds for all bags
+            matches_pc = {args.main: (0.0, t_main, pc_main_msg)}
             for i, idx in bag_indexes.items():
-                dt_gps, t_gps, gps_msg = nearest_msg(idx.gps_times, idx.gps_msgs, t_main)
-                if dt_gps is None or dt_gps > args.max_dt:
-                    msg = "No candidate" if dt_gps is None else f"nearest_dt={dt_gps*1000:.1f}ms"
-                    print(f"[WARN] GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
-                    fail_reason = f"gps{i + 1}_no_match"
+                if i == args.main:
+                    continue
+                dt_pc, t_pc, pc_msg = nearest_msg(idx.pc_times, idx.pc_msgs, t_main)
+                if dt_pc is None or dt_pc > args.max_dt:
+                    msg = "No candidate" if dt_pc is None else f"nearest_dt={dt_pc*1000:.1f}ms"
+                    print(f"[WARN] PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                    fail_reason = f"pc{i + 1}_no_match"
                     break
-                matches_gps[i] = (dt_gps, t_gps, gps_msg)
+                matches_pc[i] = (dt_pc, t_pc, pc_msg)
             if fail_reason:
                 failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
                 continue
 
-        # match camera for all bags if topics provided
-        matches_cam = {}
-        if camera_groups:
-            for group in camera_groups:
-                topic_matches = {}
-                for i, idx in bag_indexes.items():
-                    best = None
-                    used_topic = None
-                    for t in group:
-                        times = idx.cam_times.get(t, [])
-                        msgs = idx.cam_msgs.get(t, [])
-                        dt_cam, t_cam, cam_msg = nearest_msg(times, msgs, t_main)
-                        if dt_cam is None or dt_cam > args.max_dt:
-                            continue
-                        best = (dt_cam, t_cam, cam_msg)
-                        used_topic = t
-                        break
-                    if best is None:
-                        msg = "No candidate"
-                        print(f"[WARN] CAM{i + 1} {group[0]} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
-                        fail_reason = f"cam{i + 1}_{camera_group_names[tuple(group)]}_no_match"
-                        break
-                    topic_matches[i] = (best[0], best[1], best[2], used_topic)
-                if fail_reason:
-                    break
-                matches_cam[tuple(group)] = topic_matches
-            if fail_reason:
-                failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
-                continue
-
-        # save outputs for each car
-        for i, cid in enumerate(car_ids):
-            pcd_dir, gps_dir, cam_dirs = out_dirs[cid]
-            out_pc = os.path.join(pcd_dir, f"{stamp_ms}.pcd")
-            _, _, pc_msg = matches_pc[i]
-            xyz = msg_to_xyz_numpy(pc_msg)
-            save_pcd(xyz, out_pc, binary=args.binary)
-
+            # match gps for all bags if topic provided
+            matches_gps = {}
             if gps_topic:
-                out_gps = os.path.join(gps_dir, f"{stamp_ms}.json")
-                dt_gps, t_gps, gps_msg = matches_gps[i]
-                gps_dict = rosmsg_to_dict(gps_msg)
-                gps_dict["_sync_meta"] = {
-                    "ref_pc_time": t_main,
-                    "gps_time": t_gps,
-                    "dt_to_ref_ms": round(dt_gps * 1000.0, 3),
-                }
-                save_json(gps_dict, out_gps)
+                for i, idx in bag_indexes.items():
+                    dt_gps, t_gps, gps_msg = nearest_msg(idx.gps_times, idx.gps_msgs, t_main)
+                    if dt_gps is None or dt_gps > args.max_dt:
+                        msg = "No candidate" if dt_gps is None else f"nearest_dt={dt_gps*1000:.1f}ms"
+                        print(f"[WARN] GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                        fail_reason = f"gps{i + 1}_no_match"
+                        break
+                    matches_gps[i] = (dt_gps, t_gps, gps_msg)
+                if fail_reason:
+                    failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
+                    continue
 
+            # match camera for all bags if topics provided
+            matches_cam = {}
             if camera_groups:
                 for group in camera_groups:
-                    cam_dir = cam_dirs[tuple(group)]
-                    out_base = os.path.join(cam_dir, f"{stamp_ms}")
-                    _, _, cam_msg, used_topic = matches_cam[tuple(group)][i]
-                    save_image_msg(cam_msg, out_base)
+                    topic_matches = {}
+                    for i, idx in bag_indexes.items():
+                        best = None
+                        used_topic = None
+                        for t in group:
+                            times = idx.cam_times.get(t, [])
+                            msgs = idx.cam_msgs.get(t, [])
+                            dt_cam, t_cam, cam_msg = nearest_msg(times, msgs, t_main)
+                            if dt_cam is None or dt_cam > args.max_dt:
+                                continue
+                            best = (dt_cam, t_cam, cam_msg)
+                            used_topic = t
+                            break
+                        if best is None:
+                            msg = "No candidate"
+                            print(
+                                f"[WARN] CAM{i + 1} {group[0]} no match <= {args.max_dt*1000:.0f}ms "
+                                f"for t={t_main:.6f}s ({msg})"
+                            )
+                            fail_reason = f"cam{i + 1}_{camera_group_names[tuple(group)]}_no_match"
+                            break
+                        topic_matches[i] = (best[0], best[1], best[2], used_topic)
+                    if fail_reason:
+                        break
+                    matches_cam[tuple(group)] = topic_matches
+                if fail_reason:
+                    failure_counts[fail_reason] = failure_counts.get(fail_reason, 0) + 1
+                    continue
 
-        saved += 1
-        if saved % 20 == 0:
-            print(f"[INFO] Saved {saved} frames at t={t_main:.6f}s")
+            # save outputs for each car (parallel)
+            if args.save_workers <= 1:
+                try:
+                    save_frame(
+                        stamp_ms,
+                        t_main,
+                        car_ids,
+                        out_dirs,
+                        matches_pc,
+                        matches_gps,
+                        matches_cam,
+                        gps_topic,
+                        camera_groups,
+                        args.binary,
+                    )
+                    saved += 1
+                    if saved % 20 == 0:
+                        print(f"[INFO] Saved {saved} frames")
+                except Exception as exc:
+                    record_save_error(exc)
+            else:
+                fut = executor.submit(
+                    save_frame,
+                    stamp_ms,
+                    t_main,
+                    car_ids,
+                    out_dirs,
+                    matches_pc,
+                    matches_gps,
+                    matches_cam,
+                    gps_topic,
+                    camera_groups,
+                    args.binary,
+                )
+                pending.append(fut)
+                if len(pending) >= max_in_flight:
+                    consume_future(pending.popleft())
 
-        if args.max_frames > 0 and saved >= args.max_frames:
-            break
+            matched += 1
+            if args.max_frames > 0 and matched >= args.max_frames:
+                break
+
+        while pending:
+            consume_future(pending.popleft())
 
     print(f"[DONE] Scanned main pointcloud frames: {scanned}")
-    print(f"[DONE] Saved matched frames        : {saved}")
+    print(f"[DONE] Matched frames               : {matched}")
+    print(f"[DONE] Saved frames                 : {saved}")
     failed = sum(failure_counts.values())
     print(f"[DONE] Failed frames              : {failed}")
     for reason in sorted(failure_counts.keys()):
