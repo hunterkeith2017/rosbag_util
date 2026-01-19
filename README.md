@@ -42,6 +42,23 @@ Using a config file:
 python -m rosbag_util.undistort_images --config ./configs/undistort_config.json
 ```
 
+Merge multi-car point clouds (same frame):
+
+```bash
+python -m rosbag_util.merge_multi_pcd \
+  --root cooperative/zhidao \
+  --cars car1 car2 car3 \
+  --out_frame ref \
+  --ref-car car1 \
+  --yaw_only
+```
+
+Using a config file:
+
+```bash
+python -m rosbag_util.merge_multi_pcd --config ./configs/merge_multi_config.json
+```
+
 Multi car (car1 as main):
 
 ```bash
@@ -74,5 +91,5 @@ Config file (JSON):
 ```
 
 ```bash
-rosbag-extract --config config.json
+rosbag-extract --config ./configs/config.json
 ```

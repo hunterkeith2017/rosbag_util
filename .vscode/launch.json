@@ -6,7 +6,7 @@
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/src/rosbag_util/extract.py",
-      "args": ["--config", "config.json"],
+      "args": ["--config", "configs/config.json"],
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "env": {

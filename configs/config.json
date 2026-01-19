@@ -1,5 +1,8 @@
 {
-  "bags": ["/media/keiyo/主力盘/悦享多车协同感知实验数据/yuexiang/cooper/2026-01-06-15-16-04.bag", "/media/keiyo/主力盘/悦享多车协同感知实验数据/警车/cooper/2026-01-06-15-16-01.bag"],
+  "bags": [
+            "/media/keiyo/主力盘/悦享多车协同感知实验数据/yuexiang/cooper/2026-01-06-15-22-55.bag", 
+            "/media/keiyo/主力盘/悦享多车协同感知实验数据/警车/cooper/2026-01-06-15-22-52.bag"
+          ],
   "main": 0,
   "pc_topic": "/perception/lidar/concated_points_cloud",
   "gps_topic": "/location/best_position",
@@ -11,7 +14,7 @@
     "/df/camera/6/image_slave/compressed",
     "/df/camera/7/image_slave/compressed"
   ],
-  "out": "cooperative/scene1",
+  "out": "cooperative/cross_1",
   "max_dt": 0.3,
   "binary": true,
   "save_workers": 8,
