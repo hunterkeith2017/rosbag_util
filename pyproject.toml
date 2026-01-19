@@ -16,6 +16,7 @@ dependencies = [
   "open3d",
   "Pillow",
   "tomli; python_version < '3.11'",
+  "opencv-python",
 ]
 
 [project.scripts]

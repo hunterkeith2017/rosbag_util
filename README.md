@@ -25,6 +25,23 @@ rosbag-extract \
   --binary
 ```
 
+Batch undistort images:
+
+```bash
+python -m rosbag_util.undistort_images \
+  --input ./imgs \
+  --output ./undist \
+  --cam 3 \
+  --model pinhole \
+  --camera-config ./configs/camera_config.json
+```
+
+Using a config file:
+
+```bash
+python -m rosbag_util.undistort_images --config ./configs/undistort_config.json
+```
+
 Multi car (car1 as main):
 
 ```bash
