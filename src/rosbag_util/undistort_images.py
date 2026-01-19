@@ -113,18 +113,7 @@ def undistort_fisheye(img_bgr, K, dist, balance=0.0):
     return undist, used_fallback
 
 
-def main():
-    config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", help="Config file path (JSON/TOML)")
-    config_args, _ = config_parser.parse_known_args()
-    defaults = {}
-    if config_args.config:
-        cfg_path = Path(config_args.config).expanduser().resolve()
-        cfg = load_config(cfg_path)
-        if not isinstance(cfg, dict):
-            raise RuntimeError("Config file must contain a top-level object/dict")
-        defaults.update(cfg)
-
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", help="Config file path (JSON/TOML)")
     ap.add_argument("--input", help="Input image file or directory")
@@ -149,12 +138,31 @@ def main():
         help="(fisheye only) 0=crop more, 1=keep more FOV",
     )
     ap.add_argument("--suffix", default="_undist", help="Suffix for output filename (default _undist)")
+    return ap
+
+
+def parse_args(argv=None):
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", help="Config file path (JSON/TOML)")
+    config_args, _ = config_parser.parse_known_args(argv)
+    defaults = {}
+    if config_args.config:
+        cfg_path = Path(config_args.config).expanduser().resolve()
+        cfg = load_config(cfg_path)
+        if not isinstance(cfg, dict):
+            raise RuntimeError("Config file must contain a top-level object/dict")
+        defaults.update(cfg)
+
+    ap = build_parser()
     if defaults:
         ap.set_defaults(**defaults)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if not args.input or not args.output or not args.cam:
         ap.error("the following arguments are required: --input, --output, --cam")
+    return args
 
+
+def undistort_images(args) -> int:
     in_path = Path(args.input).expanduser().resolve()
     out_dir = Path(args.output).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +210,12 @@ def main():
         )
 
     print(f"Done. Processed {count} image(s). Output: {out_dir}")
+    return 0
+
+
+def main(argv=None):
+    return undistort_images(parse_args(argv))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

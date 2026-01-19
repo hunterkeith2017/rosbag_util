@@ -125,18 +125,7 @@ def merge_frame(
     return merged, None
 
 
-def main():
-    config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", help="Config file path (JSON/TOML)")
-    config_args, _ = config_parser.parse_known_args()
-    defaults = {}
-    if config_args.config:
-        cfg_path = Path(config_args.config).expanduser().resolve()
-        cfg = load_config(cfg_path)
-        if not isinstance(cfg, dict):
-            raise RuntimeError("Config file must contain a top-level object/dict")
-        defaults.update(cfg)
-
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", help="Config file path (JSON/TOML)")
     ap.add_argument("--root", default="cooperative/zhidao")
@@ -148,11 +137,31 @@ def main():
     ap.add_argument("--angle_scale", type=float, default=0.01)
     ap.add_argument("--yaw_only", action="store_true")
     ap.add_argument("--max_frames", type=int, default=-1)
+    return ap
+
+
+def parse_args(argv=None):
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", help="Config file path (JSON/TOML)")
+    config_args, _ = config_parser.parse_known_args(argv)
+    defaults = {}
+    if config_args.config:
+        cfg_path = Path(config_args.config).expanduser().resolve()
+        cfg = load_config(cfg_path)
+        if not isinstance(cfg, dict):
+            raise RuntimeError("Config file must contain a top-level object/dict")
+        defaults.update(cfg)
+
+    ap = build_parser()
     if defaults:
         ap.set_defaults(**defaults)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if not args.cars:
         ap.error("the following arguments are required: --cars")
+    return args
+
+
+def merge_multi_pcd(args) -> int:
 
     out_frame = "world" if args.out_frame == "world" else "ref"
     merge_dir = os.path.join(args.root, args.merge)
@@ -200,6 +209,11 @@ def main():
     for reason in sorted(reason_counts.keys()):
         print(f"[DONE] skip_reason {reason} -> {reason_counts[reason]}")
     print(f"[DONE] merge_dir = {os.path.abspath(merge_dir)}")
+    return 0
+
+
+def main(argv=None):
+    return merge_multi_pcd(parse_args(argv))
 
 
 if __name__ == "__main__":

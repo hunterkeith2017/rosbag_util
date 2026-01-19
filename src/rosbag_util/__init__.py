@@ -1,9 +1,10 @@
 """rosbag-util package."""
 
-from .extract import main as extract
-from .undistort_images import main as undistort_images
+from .extract import extract
+from .undistort_images import undistort_images
+from .merge_multi_pcd import merge_multi_pcd
 
-__all__ = ["__version__", "extract", "undistort_images"]
+__all__ = ["__version__", "extract", "undistort_images", "merge_multi_pcd"]
 
 try:
     from ._version import __version__

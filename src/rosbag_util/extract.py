@@ -308,7 +308,8 @@ def parse_args(argv: Optional[List[str]] = None):
     return args
 
 
-def extract(args) -> int:
+def extract(args_or_argv=None) -> int:
+    args = parse_args(args_or_argv) if not isinstance(args_or_argv, argparse.Namespace) else args_or_argv
     bags = args.bags
     if args.main < 0 or args.main >= len(bags):
         raise SystemExit("--main index out of range for --bags")
@@ -550,8 +551,7 @@ def extract(args) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    return extract(args)
+    return extract(argv)
 
 
 if __name__ == "__main__":
