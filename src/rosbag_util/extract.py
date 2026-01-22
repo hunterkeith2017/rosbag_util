@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -14,6 +15,11 @@ import numpy as np
 import open3d as o3d
 import rosbag
 import sensor_msgs.point_cloud2 as pc2
+
+
+def log_line(tag: str, msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print(f"[{tag}] {ts} {msg}")
 
 
 def get_stamp_sec(msg, t):
@@ -220,16 +226,32 @@ def build_bag_index(
     pc_topic: str,
     gps_topic: Optional[str],
     camera_topics: List[str],
+    profile: bool = False,
 ) -> BagIndex:
+    if profile:
+        t0 = time.perf_counter()
     pc_times, pc_msgs = build_time_index(bag_path, pc_topic)
+    if profile:
+        dt = time.perf_counter() - t0
+        log_line("PROFILE", f"Indexed {len(pc_times)} msgs on {pc_topic} in {dt:.2f}s")
     if gps_topic:
+        if profile:
+            t0 = time.perf_counter()
         gps_times, gps_msgs = build_time_index(bag_path, gps_topic)
+        if profile:
+            dt = time.perf_counter() - t0
+            log_line("PROFILE", f"Indexed {len(gps_times)} msgs on {gps_topic} in {dt:.2f}s")
     else:
         gps_times, gps_msgs = [], []
     cam_times = {}
     cam_msgs = {}
     for topic in camera_topics:
+        if profile:
+            t0 = time.perf_counter()
         times, msgs = build_time_index(bag_path, topic)
+        if profile:
+            dt = time.perf_counter() - t0
+            log_line("PROFILE", f"Indexed {len(times)} msgs on {topic} in {dt:.2f}s")
         cam_times[topic] = times
         cam_msgs[topic] = msgs
     return BagIndex(
@@ -284,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--binary", action="store_true", help="Write PCD as binary_compressed")
     parser.add_argument("--save-workers", type=int, default=4, help="Worker threads for saving outputs")
     parser.add_argument("--index-threads", type=int, default=0, help="Threads for indexing bags (0=auto)")
+    parser.add_argument("--profile", action="store_true", help="Print timing information")
     return parser
 
 
@@ -310,6 +333,7 @@ def parse_args(argv: Optional[List[str]] = None):
 
 def extract(args_or_argv=None) -> int:
     args = parse_args(args_or_argv) if not isinstance(args_or_argv, argparse.Namespace) else args_or_argv
+    t_start = time.perf_counter()
     bags = args.bags
     if args.main < 0 or args.main >= len(bags):
         raise SystemExit("--main index out of range for --bags")
@@ -366,16 +390,21 @@ def extract(args_or_argv=None) -> int:
             cam_dirs[tuple(group)] = cam_dir
         out_dirs[cid] = (pcd_dir, gps_dir, cam_dirs)
 
-    print(f"[INFO] Main bag: {bags[args.main]}")
-    print(f"[INFO] Bags: {len(bags)} | Cars: {', '.join(car_ids)}")
+    log_line("INFO", f"Main bag: {bags[args.main]}")
+    log_line("INFO", f"Bags: {len(bags)} | Cars: {', '.join(car_ids)}")
 
     bag_indexes = {}
     index_workers = args.index_threads or min(4, len(bags))
 
     def index_one(i_bag):
         i, bag_path = i_bag
-        print(f"[INFO] Index bag{i + 1}: {bag_path}")
-        idx = build_bag_index(bag_path, args.pc_topic, gps_topic, flat_camera_topics)
+        log_line("INFO", f"Index bag{i + 1}: {bag_path}")
+        if args.profile:
+            t0 = time.perf_counter()
+        idx = build_bag_index(bag_path, args.pc_topic, gps_topic, flat_camera_topics, profile=args.profile)
+        if args.profile:
+            dt = time.perf_counter() - t0
+            log_line("PROFILE", f"Indexed bag{i + 1} in {dt:.2f}s")
         return i, idx
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=index_workers) as executor:
@@ -385,22 +414,24 @@ def extract(args_or_argv=None) -> int:
             if not idx.pc_times:
                 raise RuntimeError(f"No pointcloud messages found in bag{i + 1} on {args.pc_topic}")
             if gps_topic and not idx.gps_times:
-                print(f"[WARN] No GPS messages found in bag{i + 1} on {gps_topic}")
+                    log_line("WARN", f"No GPS messages found in bag{i + 1} on {gps_topic}")
             if camera_groups:
                 for group in camera_groups:
                     if not any(idx.cam_times.get(t) for t in group):
                         pref = group[0]
-                        print(f"[WARN] No camera messages found in bag{i + 1} on {pref} (or fallback)")
+                        log_line("WARN", f"No camera messages found in bag{i + 1} on {pref} (or fallback)")
             bag_indexes[i] = idx
 
+    t_index_end = time.perf_counter()
     matched = 0
     saved = 0
     scanned = 0
     failure_counts = {}
+    save_time_s = 0.0
 
     def record_save_error(err: Exception):
         failure_counts["save_error"] = failure_counts.get("save_error", 0) + 1
-        print(f"[WARN] Save failed: {err}")
+        log_line("WARN", f"Save failed: {err}")
 
     main_idx = bag_indexes[args.main]
     max_in_flight = max(1, max(1, args.save_workers) * 4)
@@ -408,11 +439,14 @@ def extract(args_or_argv=None) -> int:
 
     def consume_future(fut):
         nonlocal saved
+        nonlocal save_time_s
         try:
-            fut.result()
+            result = fut.result()
+            if args.profile and isinstance(result, float):
+                save_time_s += result
             saved += 1
             if saved % 20 == 0:
-                print(f"[INFO] Saved {saved} frames")
+                log_line("INFO", f"Saved {saved} frames")
         except Exception as exc:
             record_save_error(exc)
 
@@ -430,7 +464,10 @@ def extract(args_or_argv=None) -> int:
                 dt_pc, t_pc, pc_msg = nearest_msg(idx.pc_times, idx.pc_msgs, t_main)
                 if dt_pc is None or dt_pc > args.max_dt:
                     msg = "No candidate" if dt_pc is None else f"nearest_dt={dt_pc*1000:.1f}ms"
-                    print(f"[WARN] PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                    log_line(
+                        "WARN",
+                        f"PC{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})",
+                    )
                     fail_reason = f"pc{i + 1}_no_match"
                     break
                 matches_pc[i] = (dt_pc, t_pc, pc_msg)
@@ -445,7 +482,10 @@ def extract(args_or_argv=None) -> int:
                     dt_gps, t_gps, gps_msg = nearest_msg(idx.gps_times, idx.gps_msgs, t_main)
                     if dt_gps is None or dt_gps > args.max_dt:
                         msg = "No candidate" if dt_gps is None else f"nearest_dt={dt_gps*1000:.1f}ms"
-                        print(f"[WARN] GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})")
+                        log_line(
+                            "WARN",
+                            f"GPS{i + 1} no match <= {args.max_dt*1000:.0f}ms for t={t_main:.6f}s ({msg})",
+                        )
                         fail_reason = f"gps{i + 1}_no_match"
                         break
                     matches_gps[i] = (dt_gps, t_gps, gps_msg)
@@ -472,9 +512,10 @@ def extract(args_or_argv=None) -> int:
                             break
                         if best is None:
                             msg = "No candidate"
-                            print(
-                                f"[WARN] CAM{i + 1} {group[0]} no match <= {args.max_dt*1000:.0f}ms "
-                                f"for t={t_main:.6f}s ({msg})"
+                            log_line(
+                                "WARN",
+                                f"CAM{i + 1} {group[0]} no match <= {args.max_dt*1000:.0f}ms "
+                                f"for t={t_main:.6f}s ({msg})",
                             )
                             fail_reason = f"cam{i + 1}_{camera_group_names[tuple(group)]}_no_match"
                             break
@@ -489,6 +530,8 @@ def extract(args_or_argv=None) -> int:
             # save outputs for each car (parallel)
             if args.save_workers <= 1:
                 try:
+                    if args.profile:
+                        t0 = time.perf_counter()
                     save_frame(
                         stamp_ms,
                         t_main,
@@ -501,25 +544,45 @@ def extract(args_or_argv=None) -> int:
                         camera_groups,
                         args.binary,
                     )
+                    if args.profile:
+                        save_time_s += time.perf_counter() - t0
                     saved += 1
                     if saved % 20 == 0:
-                        print(f"[INFO] Saved {saved} frames")
+                        log_line("INFO", f"Saved {saved} frames")
                 except Exception as exc:
                     record_save_error(exc)
             else:
-                fut = executor.submit(
-                    save_frame,
-                    stamp_ms,
-                    t_main,
-                    car_ids,
-                    out_dirs,
-                    matches_pc,
-                    matches_gps,
-                    matches_cam,
-                    gps_topic,
-                    camera_groups,
-                    args.binary,
-                )
+                if args.profile:
+                    def timed_save():
+                        t0 = time.perf_counter()
+                        save_frame(
+                            stamp_ms,
+                            t_main,
+                            car_ids,
+                            out_dirs,
+                            matches_pc,
+                            matches_gps,
+                            matches_cam,
+                            gps_topic,
+                            camera_groups,
+                            args.binary,
+                        )
+                        return time.perf_counter() - t0
+                    fut = executor.submit(timed_save)
+                else:
+                    fut = executor.submit(
+                        save_frame,
+                        stamp_ms,
+                        t_main,
+                        car_ids,
+                        out_dirs,
+                        matches_pc,
+                        matches_gps,
+                        matches_cam,
+                        gps_topic,
+                        camera_groups,
+                        args.binary,
+                    )
                 pending.append(fut)
                 if len(pending) >= max_in_flight:
                     consume_future(pending.popleft())
@@ -531,21 +594,28 @@ def extract(args_or_argv=None) -> int:
         while pending:
             consume_future(pending.popleft())
 
-    print(f"[DONE] Scanned main pointcloud frames: {scanned}")
-    print(f"[DONE] Matched frames               : {matched}")
-    print(f"[DONE] Saved frames                 : {saved}")
+    t_end = time.perf_counter()
+    log_line("DONE", f"Scanned main pointcloud frames: {scanned}")
+    log_line("DONE", f"Matched frames               : {matched}")
+    log_line("DONE", f"Saved frames                 : {saved}")
     failed = sum(failure_counts.values())
-    print(f"[DONE] Failed frames              : {failed}")
+    log_line("DONE", f"Failed frames              : {failed}")
     for reason in sorted(failure_counts.keys()):
-        print(f"[DONE] Failure reason: {reason} -> {failure_counts[reason]}")
+        log_line("DONE", f"Failure reason: {reason} -> {failure_counts[reason]}")
     for cid in car_ids:
         pcd_dir, gps_dir, cam_dirs = out_dirs[cid]
-        print(f"[DONE] {cid} pcd -> {os.path.abspath(pcd_dir)}")
+        log_line("DONE", f"{cid} pcd -> {os.path.abspath(pcd_dir)}")
         if gps_topic:
-            print(f"[DONE] {cid} gps -> {os.path.abspath(gps_dir)}")
+            log_line("DONE", f"{cid} gps -> {os.path.abspath(gps_dir)}")
         for group in camera_groups:
             pref = group[0]
-            print(f"[DONE] {cid} cam {pref} -> {os.path.abspath(cam_dirs[tuple(group)])}")
+            log_line("DONE", f"{cid} cam {pref} -> {os.path.abspath(cam_dirs[tuple(group)])}")
+
+    if args.profile:
+        log_line("PROFILE", f"Indexing time: {t_index_end - t_start:.2f}s")
+        log_line("PROFILE", f"Total time: {t_end - t_start:.2f}s")
+        if save_time_s:
+            log_line("PROFILE", f"Save time (sum of save_frame): {save_time_s:.2f}s")
 
     return 0
 
