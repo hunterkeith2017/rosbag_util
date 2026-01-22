@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "rosbag-extract (config.json)",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/src/rosbag_util/extract.py",
       "args": ["--config", "configs/config.json"],
@@ -15,7 +15,7 @@
     },
     {
       "name": "rosbag-extract (args)",
-      "type": "python",
+      "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/src/rosbag_util/extract.py",
       "args": [
